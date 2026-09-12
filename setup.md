@@ -67,6 +67,20 @@ xfreerdp /v:desktop.<tailnet>.ts.net /u:runner
 
 ---
 
+## Windows (Tailscale RDP)
+
+**Workflow**: Actions → **"Windows (Tailscale)"** → Run workflow. Pick an edition (`11l` = Windows 11 LTSC is the light default), RAM and cores.
+
+This one boots a **real Windows VM** (KVM-accelerated QEMU), so it's the slowest to come up — Windows installs itself unattended, typically **15–30 min**. The Summary shows the address right away, but RDP won't answer until a **✅ ready** line appears.
+
+- **Password:** same rule as the desktop — your `LAB_PASSWORD` secret, or generated and read over the tailnet (`ssh runner@windows.<tailnet>.ts.net cat .lab-credentials`).
+- **Connect:** `mstsc` → `windows.<tailnet>.ts.net:3389` → username `Docker`.
+- **Fast path:** Tailscale carries UDP, so RDP's bitmap caching + compression work at full speed. The VM is pre-tuned (`windows/install.bat`): AVC444 codec, animations off, flat wallpaper, outline drag. No client-side UDP tweak needed.
+
+> The Windows lab is the heaviest and the most conspicuous — a nested KVM VM held open for hours is exactly the shape platform abuse-detection looks for. Use it deliberately and keep sessions short.
+
+---
+
 ## Shell (Tailscale SSH)
 
 **Workflow**: Actions → **"Shell (Tailscale)"** → Run workflow.

@@ -1,0 +1,245 @@
+name: Windows (Tailscale)
+
+# A real Windows VM on an Ubuntu runner, reachable ONLY through Tailscale by RDP.
+# Nothing is exposed to the public internet, and no password reaches the run log.
+#
+#   dockur/windows  ->  a real Windows VM (KVM-accelerated QEMU), speaking RDP
+#   Tailscale       ->  private WireGuard mesh; fixed address every run, carries UDP
+#
+# Requires a TS_AUTHKEY secret. Optionally a LAB_PASSWORD secret (see "Credentials").
+# Unlike the Ubuntu labs this boots a nested VM, so it is the slowest to come up
+# (Windows installs itself first) and the heaviest on the runner.
+on:
+  workflow_dispatch:
+    inputs:
+      version:
+        description: "Windows edition to install."
+        type: choice
+        default: "11l"
+        options: [ "11l", "11", "10l", "10", "2022", "2025", "tiny11" ]
+      ram:
+        description: "RAM for the VM. The runner has 16G total."
+        type: string
+        default: "12G"
+      cores:
+        description: "CPU cores for the VM. The runner has 4."
+        type: string
+        default: "3"
+      hours:
+        description: "How long to hold it open (max 5.7; install eats the first ~15-30 min)."
+        type: string
+        default: "5"
+
+permissions:
+  contents: read
+
+concurrency:
+  group: windows
+  cancel-in-progress: true
+
+jobs:
+  windows:
+    runs-on: ubuntu-latest
+    timeout-minutes: 360
+    env:
+      VERSION: ${{ inputs.version }}
+      RAM_SIZE: ${{ inputs.ram }}
+      CPU_CORES: ${{ inputs.cores }}
+      HOURS: ${{ inputs.hours }}
+    steps:
+      - name: Verify Tailscale secret exists
+        env:
+          TS_AUTHKEY: ${{ secrets.TS_AUTHKEY }}
+        run: |
+          if [ -z "${TS_AUTHKEY:-}" ]; then
+            echo "::error::TS_AUTHKEY secret is not set. This workflow requires Tailscale."
+            echo "::error::Repo -> Settings -> Secrets and variables -> Actions -> New repository secret -> TS_AUTHKEY."
+            echo "::error::Get a key at https://login.tailscale.com/admin/settings/keys (Ephemeral + Reusable, NOT tagged)."
+            exit 1
+          fi
+          echo "TS_AUTHKEY is set."
+
+      - name: Free disk space and enable KVM
+        run: |
+          set -euo pipefail
+          sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc \
+                      /opt/hostedtoolcache/CodeQL /usr/local/share/boost || true
+          sudo mkdir -p /mnt/winstorage && sudo chmod 777 /mnt/winstorage
+          df -h / /mnt
+
+          echo 'KERNEL=="kvm", GROUP="kvm", MODE="0666", OPTIONS+="static_node=kvm"' \
+            | sudo tee /etc/udev/rules.d/99-kvm4all.rules > /dev/null
+          sudo udevadm control --reload-rules
+          sudo udevadm trigger --name-match=kvm
+          ls -l /dev/kvm || { echo "::error::No /dev/kvm — this runner can't do hardware virtualization."; exit 1; }
+          echo "KVM is available."
+
+      - name: Set the RDP password (never printed)
+        env:
+          LAB_PASSWORD: ${{ secrets.LAB_PASSWORD }}
+        run: |
+          set -uo pipefail
+          # LAB_PASSWORD secret set -> use it (you already know it).
+          # not set               -> generate one, readable only over Tailscale SSH.
+          if [ -n "${LAB_PASSWORD:-}" ]; then
+            PASS="$LAB_PASSWORD"; SRC="secret"
+          else
+            PASS="$(openssl rand -hex 6)"; SRC="random"
+          fi
+          echo "::add-mask::$PASS"
+          # WINPASS is consumed by the next step; it stays masked in the log.
+          echo "WINPASS=${PASS}" >> "$GITHUB_ENV"
+          echo "CRED_SRC=${SRC}" >> "$GITHUB_ENV"
+          umask 077
+          printf 'user: Docker\npass: %s\n' "$PASS" > /home/runner/.lab-credentials
+          echo "Password set (source: ${SRC}). It is not written to this log."
+
+      - name: Check out the OEM tuning script
+        uses: actions/checkout@v4
+
+      - name: Start the Windows VM
+        run: |
+          set -euo pipefail
+          mkdir -p /mnt/winstorage/oem
+          cp windows/install.bat /mnt/winstorage/oem/install.bat
+          ls -l /mnt/winstorage/oem/
+
+          docker run -d --name windows \
+            -e VERSION="$VERSION" \
+            -e RAM_SIZE="$RAM_SIZE" \
+            -e CPU_CORES="$CPU_CORES" \
+            -e DISK_SIZE=256G \
+            -e USERNAME=Docker \
+            -e PASSWORD="$WINPASS" \
+            --device=/dev/kvm --device=/dev/net/tun --cap-add NET_ADMIN \
+            -p 8006:8006 -p 3389:3389/tcp -p 3389:3389/udp \
+            -v /mnt/winstorage:/storage \
+            --stop-timeout 120 \
+            dockurr/windows
+          sleep 10
+          docker logs --tail 30 windows || true
+          echo "Windows is installing — this is unattended and takes a while."
+
+      - name: Connect Tailscale and hold the session open
+        env:
+          TS_AUTHKEY: ${{ secrets.TS_AUTHKEY }}
+        run: |
+          set -uo pipefail
+
+          # --- Join the tailnet --------------------------------------------------
+          # --ssh gives a keyless terminal on the RUNNER, which is how a random RDP
+          # password is retrieved without it ever touching this public log.
+          curl -fsSL https://tailscale.com/install.sh | sh > /dev/null 2>&1
+          sudo tailscale up --authkey="$TS_AUTHKEY" --hostname=windows --ssh --accept-routes \
+            > /tmp/ts.log 2>&1 || { echo "::error::tailscale up failed"; cat /tmp/ts.log || true; exit 1; }
+
+          TS_HOST=$(sudo tailscale status --json 2>/dev/null | jq -r '.Self.DNSName // empty' | sed 's/\.$//' || true)
+          TS_IP=$(sudo tailscale ip -4 2>/dev/null | head -1 || true)
+          if [ -z "$TS_HOST" ]; then
+            echo "::error::Tailscale joined but could not read the hostname."
+            sudo tailscale status || true
+            exit 1
+          fi
+          echo "Tailscale name: ${TS_HOST}"
+
+          SECS=$(awk -v h="$HOURS" 'BEGIN{s=h*3600; if(s<600)s=600; if(s>20520)s=20520; printf "%d", s}')
+          ENDS_AT=$(date -u -d "+${SECS} seconds" '+%H:%M UTC')
+
+          # --- Write initial Summary (no password) ------------------------------
+          {
+            echo "# Windows VM — private, Tailscale only"
+            echo ""
+            echo "Windows is installing (unattended, typically **15–30 min**)."
+            echo "A **ready** line appears below when the desktop actually answers."
+            echo ""
+            echo "## Remote Desktop"
+            echo ""
+            echo "\`\`\`"
+            echo "${TS_HOST}:3389"
+            echo "\`\`\`"
+            echo ""
+            echo "- Username: \`Docker\`"
+            if [ "${CRED_SRC}" = "secret" ]; then
+              echo "- Password: the one in your \`LAB_PASSWORD\` secret."
+            else
+              echo "- Password: generated, **not shown here**. Read it over the tailnet (keyless):"
+              echo ""
+              echo "  \`\`\`"
+              echo "  ssh runner@${TS_HOST} cat .lab-credentials"
+              echo "  \`\`\`"
+              echo "  Set a \`LAB_PASSWORD\` secret to skip this next time."
+            fi
+            echo ""
+            echo "> Open \`mstsc\` -> paste the address into **Computer** -> Connect."
+            echo "> Same address every run — save it once."
+            echo ""
+            echo "> **Private:** only devices on your tailnet can reach it; nothing is exposed"
+            echo "> to the internet, and no password appears in this log. Tailscale carries UDP,"
+            echo "> so RDP's fast path (bitmap caching + compression) works at full speed."
+            echo ""
+            echo "| | |"
+            echo "|---|---|"
+            echo "| Edition | \`${VERSION}\` |"
+            echo "| RAM / cores | ${RAM_SIZE} / ${CPU_CORES} |"
+            echo "| Tailnet IP | \`${TS_IP}\` |"
+            echo "| Auto-stop | ~${ENDS_AT} |"
+            echo ""
+          } >> "$GITHUB_STEP_SUMMARY"
+
+          echo "::notice title=RDP address (ready after install)::${TS_HOST}:3389  (user: Docker)"
+
+          # --- Wait for Windows to finish installing ----------------------------
+          echo "Waiting for Windows to answer a real RDP handshake..."
+          cat > /tmp/rdp_probe.py <<'PY'
+          import socket, sys
+          req = bytes.fromhex("030000130ee000000000000100080003000000")
+          try:
+              s = socket.create_connection(("127.0.0.1", 3389), timeout=5)
+              s.sendall(req)
+              r = s.recv(19)
+              s.close()
+          except Exception:
+              sys.exit(1)
+          sys.exit(0 if len(r) >= 6 and r[0] == 3 and r[5] == 0xD0 else 1)
+          PY
+          READY=0
+          for i in $(seq 1 300); do
+            if python3 /tmp/rdp_probe.py 2>/dev/null; then
+              echo "RDP handshake succeeded — Windows is genuinely ready."; READY=1; break
+            fi
+            if [ $((i % 30)) -eq 0 ]; then echo "  ...still installing ($((i/6)) min)"; docker logs --tail 5 windows 2>&1 || true; fi
+            sleep 10
+          done
+
+          if [ "$READY" = "1" ]; then
+            sleep 30
+            {
+              echo "---"
+              echo "## ✅ Windows finished installing — the desktop is live"
+              echo ""
+              echo "\`\`\`"
+              echo "${TS_HOST}:3389"
+              echo "\`\`\`"
+              echo ""
+              echo "Sign in as \`Docker\` (password as above)."
+            } >> "$GITHUB_STEP_SUMMARY"
+            echo "::notice title=Windows is READY::${TS_HOST}:3389  (user: Docker)"
+          else
+            echo "::warning::Windows never answered RDP. Recent VM logs:"
+            docker logs --tail 60 windows || true
+          fi
+
+          trap 'sudo tailscale logout >/dev/null 2>&1 || true' EXIT
+
+          # Hold the job open so the desktop stays reachable (clamped under the 6h cap).
+          END=$((SECONDS + SECS))
+          while [ $SECONDS -lt $END ]; do
+            if [ -f /home/runner/STOP ]; then echo "STOP file found — shutting down."; break; fi
+            if ! sudo tailscale status > /dev/null 2>&1; then
+              echo "::warning::Tailscale disconnected. Attempting reconnect..."
+              sudo tailscale up --authkey="$TS_AUTHKEY" --hostname=windows --ssh --accept-routes \
+                > /tmp/ts.log 2>&1 || true
+            fi
+            sleep 15
+          done
+          echo "Reached time limit; shutting down. The VM and everything on it is now gone."

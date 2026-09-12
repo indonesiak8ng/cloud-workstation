@@ -2,10 +2,13 @@
 
 An on-demand **Ubuntu 24.04 workspace** that runs on a GitHub Actions runner and is reachable **only over [Tailscale](https://tailscale.com)** — your own private network. Nothing is exposed to the public internet, and no password is ever written to the run log.
 
-Two ways in, launched from the **Actions** tab:
+Three ways in, launched from the **Actions** tab:
 
 - **Desktop** — a full XFCE desktop over RDP (`mstsc`, Remmina, FreeRDP). Tuned to stay smooth over the link.
 - **Shell** — a plain terminal over Tailscale SSH. Keyless, ready in about a minute.
+- **Windows** — a real Windows VM over RDP. Installs itself first (~15–30 min), then answers on a fixed address.
+
+Each lab has its own workflow and its own `concurrency` group, so you can run a Desktop, a Shell and a Windows box **at the same time** — they don't cancel each other. A second run of the *same* lab does cancel the older one.
 
 Ephemeral by design: an Actions job is capped at 6 hours, then everything is destroyed. A throwaway workspace, not persistent hosting.
 
@@ -50,6 +53,8 @@ ssh runner@shell.<tailnet>.ts.net
 ```
 Pick a **toolset** at launch (`base`, `security`, `dev`, `everything`). On `security`, the command `kali` opens a Kali rolling container sharing `~/lab` and the host network.
 
+**Windows:** Actions → **"Windows (Tailscale)"** → Run workflow (pick an edition). It installs itself first, so the desktop answers after ~15–30 min — the Summary shows a ✅ ready line when it does. Then `mstsc` to `windows.<tailnet>.ts.net:3389`, sign in as `Docker` (same password rule as the desktop).
+
 ## Stopping early
 
 `touch ~/STOP` on the desktop (or `touch ~/lab/STOP` on the shell), or cancel the run from the Actions tab. Otherwise it auto-stops at the hours you chose. A new run of the same lab cancels an older one via its `concurrency` group.
@@ -71,6 +76,8 @@ Pick a **toolset** at launch (`base`, `security`, `dev`, `everything`). On `secu
 ```
 .github/workflows/desktop.yml   # XFCE desktop over Tailscale RDP
 .github/workflows/shell.yml     # Ubuntu shell over Tailscale SSH
+.github/workflows/windows.yml   # Windows VM (dockur/windows) over Tailscale RDP
+windows/install.bat             # unattended OEM tuning for the Windows VM
 setup.md
 README.md
 ```
