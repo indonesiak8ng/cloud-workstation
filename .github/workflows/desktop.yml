@@ -76,10 +76,16 @@ jobs:
           echo "::endgroup::"
 
           echo "::group::Sunshine (latest .deb for Ubuntu 24.04)"
+          # Asset name carries the version, e.g. sunshine_2026.906.222525-1+ubuntu24.04_amd64.deb,
+          # so we resolve it from the release rather than guessing a static filename.
           URL=$(curl -fsSL https://api.github.com/repos/LizardByte/Sunshine/releases/latest \
             | jq -r '.assets[].browser_download_url' 2>/dev/null \
-            | grep -E 'ubuntu-24\.04.*amd64\.deb$' | head -1 || true)
-          [ -z "$URL" ] && URL="https://github.com/LizardByte/Sunshine/releases/latest/download/sunshine-ubuntu-24.04-amd64.deb"
+            | grep -E 'ubuntu24\.04_amd64\.deb$' | head -1 || true)
+          if [ -z "$URL" ]; then
+            echo "::error::Could not find the Ubuntu 24.04 Sunshine .deb in the latest release. Assets seen:"
+            curl -fsSL https://api.github.com/repos/LizardByte/Sunshine/releases/latest | jq -r '.assets[].name' || true
+            exit 1
+          fi
           echo "Fetching: $URL"
           curl -fL -o /tmp/sunshine.deb "$URL"
           sudo apt-get install -y /tmp/sunshine.deb
