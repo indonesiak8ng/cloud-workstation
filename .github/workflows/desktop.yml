@@ -271,6 +271,9 @@ jobs:
             echo "encoder = software"
             echo "sw_preset = ultrafast"
             echo "sw_tune = zerolatency"
+            # Force X11 grab: the default KMS/DRM capture aborts on a GPU-less box
+            # (no /dev/dri render node) instead of falling back.
+            echo "capture = x11"
             echo "origin_web_ui_allowed = wan"
             echo "csrf_allowed_origins = https://${TS_IP}:47990,https://${TS_HOST}:47990"
             echo "min_log_level = info"
@@ -282,10 +285,14 @@ jobs:
             curl -sk https://127.0.0.1:47990/ >/dev/null 2>&1 && { echo "Sunshine is up."; break; }
             sleep 2
           done
-          # If Sunshine did not stay up, surface why right here in the run log.
+          # If Sunshine did not stay up, surface why — as an annotation (readable via
+          # the API) and as raw log tail in the step output.
           if ! pgrep -x sunshine >/dev/null 2>&1; then
-            echo "::warning title=Sunshine did not stay up::last 30 log lines below"
-            tail -30 /tmp/sunshine.log || true
+            REASON=$(grep -iE 'error|fatal|abort|assert|exception|terminate|cannot|failed|no such|permission|unable' /tmp/sunshine.log 2>/dev/null | tail -4 | tr '\n' '|' | tr -d '\r' | cut -c1-500)
+            echo "::error title=Sunshine did not stay up::${REASON:-unknown - see log tail}"
+            echo "----- sunshine.log tail -----"; tail -40 /tmp/sunshine.log || true
+          else
+            echo "Sunshine is running."
           fi
 
           SECS=$(awk -v h="$HOURS" 'BEGIN{s=h*3600; if(s<300)s=300; if(s>20520)s=20520; printf "%d", s}')
