@@ -31,39 +31,40 @@ Two workspaces, both private over Tailscale. This page is the full walkthrough a
 
 ---
 
-## Desktop (Tailscale RDP)
+## Desktop (Sunshine + Moonlight)
 
 **Workflow**: Actions → **"Desktop (Tailscale)"** → Run workflow.
 
-Ready in **~2–3 min** — it installs XFCE + xrdp on the runner directly (no VM to boot, no image to pull). The desktop is XFCE with compositing off and outline-drag on, so it stays responsive over the link.
+Ready in **~3–4 min** — it installs a Yaru-themed XFCE desktop plus **Sunshine**, which streams the screen as low-latency **H.264 video**. You watch it in **[Moonlight](https://moonlight-stream.org)** (free, install on your PC first). This is a video stream, not RDP — that's why it feels smooth even far from the runner. The runner has no GPU, so encoding is done in software; XFCE is kept light so the CPU has room to encode.
 
 ### The password (this is the private bit)
 
-Pick one of two. Neither ever writes the password to the public run log.
+The Sunshine web UI (used once, to pair) logs in as `runner`. The password never reaches the public run log:
 
-| | How to log in | Setup |
+| | Password | Setup |
 |---|---|---|
-| **`LAB_PASSWORD` secret** *(recommended for repeat use)* | Use the password you chose | Add a `LAB_PASSWORD` repo secret once |
-| **Auto-generated** *(default)* | Read it over the tailnet: `ssh runner@desktop.<tailnet>.ts.net cat .lab-credentials` | Nothing — it just works |
+| **`LAB_PASSWORD` secret** *(recommended)* | the one you chose | add a `LAB_PASSWORD` repo secret once |
+| **Auto-generated** *(default)* | read over the tailnet: `ssh runner@desktop.<tailnet>.ts.net cat .lab-credentials` | nothing — it just works |
 
-### Connect
+### Pair (once)
 
-1. Make sure Tailscale is running on your PC (*Connected*).
-2. Open the run's **Summary** tab, copy `desktop.<tailnet>.ts.net:3389`.
-3. **Win key → type `mstsc` → Enter →** paste into **Computer → Connect**.
-4. Accept the self-signed certificate warning (expected).
-5. Username `runner`; password per the table above.
+1. Install **Moonlight** on your PC and make sure **Tailscale is connected**.
+2. In Moonlight → **Add PC manually** → enter `desktop.<tailnet>.ts.net`. It shows a 4-digit **PIN**.
+3. Open **`https://desktop.<tailnet>.ts.net:47990`**, accept the self-signed cert, log in as `runner` (password above).
+4. Go to the **PIN** tab, paste the PIN, **Send**. Paired.
 
-On Linux/macOS:
-```bash
-xfreerdp /v:desktop.<tailnet>.ts.net /u:runner
-```
+### Stream
 
-### Making it feel smoother
+Back in Moonlight, click the PC → **Desktop**. For the best feel, in Moonlight **Settings**:
 
-- **In `mstsc` → Show Options → Experience**, set the connection to *LAN* and drop the colour depth to 16-bit if you're far from the runner — it trades a little colour for a lot of responsiveness.
-- **Resize before connecting**, not during — XFCE resizes cleanly at login, and re-negotiating mid-session costs a full redraw.
-- The single biggest lever is already set for you: **compositing is off**, so window drags are outline-only instead of a repaint per pixel.
+- **Resolution:** 1080p (or 720p if you're far from the runner — fewer pixels to encode)
+- **FPS:** 60
+- **Bitrate:** ~15–20 Mbps
+- **V-Sync:** off; **frame pacing:** on
+
+> If it feels CPU-bound (tearing, dropped frames), drop to 720p first — software encoding is the bottleneck on a GPU-less box, and halving the pixels helps most.
+
+You also get a **shell on the same machine** any time: `ssh runner@desktop.<tailnet>.ts.net`.
 
 ---
 

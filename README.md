@@ -4,7 +4,7 @@ An on-demand **Ubuntu 24.04 workspace** that runs on a GitHub Actions runner and
 
 Three ways in, launched from the **Actions** tab:
 
-- **Desktop** — a full XFCE desktop over RDP (`mstsc`, Remmina, FreeRDP). Tuned to stay smooth over the link.
+- **Desktop** — a Yaru-themed XFCE desktop **streamed with Sunshine** (software H.264) and viewed in **[Moonlight](https://moonlight-stream.org)**. A low-latency video stream, not RDP — this is the smooth one.
 - **Shell** — a plain terminal over Tailscale SSH. Keyless, ready in about a minute.
 - **Windows** — a real Windows VM over RDP. Installs itself first (~15–30 min), then answers on a fixed address.
 
@@ -39,13 +39,13 @@ Full walkthrough and troubleshooting: **[setup.md](setup.md)**.
 
 ## Using it
 
-**Desktop:** Actions → **"Desktop (Tailscale)"** → Run workflow. Ready in ~2–3 min. The run's **Summary** tab shows `desktop.<tailnet>.ts.net:3389`; paste that into `mstsc`, sign in as `runner`.
+**Desktop:** Actions → **"Desktop (Tailscale)"** → Run workflow. Ready in ~3–4 min (it installs XFCE + Sunshine). Then, with **[Moonlight](https://moonlight-stream.org)** installed on your PC:
 
-- With a `LAB_PASSWORD` secret, use that password.
-- Without one, read the generated password over the tailnet (keyless):
-  ```bash
-  ssh runner@desktop.<tailnet>.ts.net cat .lab-credentials
-  ```
+1. In Moonlight, **Add PC manually** → `desktop.<tailnet>.ts.net`. It shows a 4-digit **PIN**.
+2. Open `https://desktop.<tailnet>.ts.net:47990`, log in as `runner` (your `LAB_PASSWORD`, or the generated one via `ssh runner@desktop.<tailnet>.ts.net cat .lab-credentials`), and enter the PIN.
+3. Click the PC → **Desktop**. In Moonlight settings, 1080p/60/~15–20 Mbps feels best.
+
+The full pairing walkthrough is in **[setup.md](setup.md)**.
 
 **Shell:** Actions → **"Shell (Tailscale)"** → Run workflow. Ready in ~1 min.
 ```bash
