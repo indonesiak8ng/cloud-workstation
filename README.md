@@ -7,6 +7,7 @@ Three ways in, launched from the **Actions** tab:
 - **Desktop** — a Yaru-themed XFCE desktop **streamed with Sunshine** (software H.264) and viewed in **[Moonlight](https://moonlight-stream.org)**. A low-latency video stream, not RDP — this is the smooth one.
 - **Shell** — a plain terminal over Tailscale SSH. Keyless, ready in about a minute.
 - **Windows** — a real Windows VM over RDP. Installs itself first (~15–30 min), then answers on a fixed address.
+- **Kali** — a full Kali Linux desktop over RDP (`mstsc`). The security toolkit with a GUI, on your tailnet.
 
 Each lab has its own workflow and its own `concurrency` group, so you can run a Desktop, a Shell and a Windows box **at the same time** — they don't cancel each other. A second run of the *same* lab does cancel the older one.
 
@@ -55,6 +56,8 @@ Pick a **toolset** at launch (`base`, `security`, `dev`, `everything`). On `secu
 
 **Windows:** Actions → **"Windows (Tailscale)"** → Run workflow (pick an edition). It installs itself first, so the desktop answers after ~15–30 min — the Summary shows a ✅ ready line when it does. Then `mstsc` to `windows.<tailnet>.ts.net:3389`, sign in as `Docker` (same password rule as the desktop).
 
+**Kali:** Actions → **"Kali (Tailscale)"** → Run workflow. First run pulls a multi-GB image (~5–10 min). Then `mstsc` to `kali.<tailnet>.ts.net:3389`, sign in as **`abc`** (the real Linux user, not `kali`), password per the usual rule. RDP only — no Moonlight.
+
 ## Stopping early
 
 `touch ~/STOP` on the desktop (or `touch ~/lab/STOP` on the shell), or cancel the run from the Actions tab. Otherwise it auto-stops at the hours you chose. A new run of the same lab cancels an older one via its `concurrency` group.
@@ -77,6 +80,7 @@ Pick a **toolset** at launch (`base`, `security`, `dev`, `everything`). On `secu
 .github/workflows/desktop.yml   # XFCE desktop over Tailscale RDP
 .github/workflows/shell.yml     # Ubuntu shell over Tailscale SSH
 .github/workflows/windows.yml   # Windows VM (dockur/windows) over Tailscale RDP
+.github/workflows/kali.yml      # Kali Linux desktop (linuxserver image) over Tailscale RDP
 windows/install.bat             # unattended OEM tuning for the Windows VM
 setup.md
 README.md

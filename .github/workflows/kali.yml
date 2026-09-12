@@ -1,0 +1,314 @@
+name: Kali (Tailscale RDP)
+
+# A full Kali Linux desktop, reachable ONLY over Tailscale by RDP. No Sunshine, no
+# Moonlight, no public tunnel — just xrdp on your tailnet, and no password in the log.
+#
+#   linuxserver/kali-linux  ->  the maintained Kali desktop image
+#   xrdp + XFCE (in it)      ->  native RDP, tuned to be cheap to redraw over a link
+#   Tailscale                ->  private WireGuard mesh; fixed name every run
+#
+# The container publishes 3389 on the runner; Tailscale on the runner makes that
+# reachable at kali.<tailnet>.ts.net:3389 and nowhere else.
+#
+# Requires a TS_AUTHKEY secret. Optionally a LAB_PASSWORD secret (else one is
+# generated and read back over Tailscale SSH).
+on:
+  workflow_dispatch:
+    inputs:
+      hostname:
+        description: "Tailscale machine name -> <name>.<tailnet>.ts.net"
+        type: string
+        default: "kali"
+      hours:
+        description: "How long to hold it open (max 5.7; shorter = lower profile)."
+        type: string
+        default: "3"
+
+permissions:
+  contents: read
+
+concurrency:
+  group: kali
+  cancel-in-progress: true
+
+jobs:
+  kali:
+    runs-on: ubuntu-latest
+    timeout-minutes: 360
+    env:
+      TS_HOSTNAME: ${{ inputs.hostname }}
+      HOURS: ${{ inputs.hours }}
+    steps:
+      - name: Verify Tailscale secret exists
+        env:
+          TS_AUTHKEY: ${{ secrets.TS_AUTHKEY }}
+        run: |
+          if [ -z "${TS_AUTHKEY:-}" ]; then
+            echo "::error::TS_AUTHKEY secret is not set. This workflow requires Tailscale."
+            echo "::error::Repo -> Settings -> Secrets and variables -> Actions -> New repository secret -> TS_AUTHKEY."
+            echo "::error::Get a key at https://login.tailscale.com/admin/settings/keys (Ephemeral + Reusable, NOT tagged)."
+            exit 1
+          fi
+          echo "TS_AUTHKEY is set."
+
+      - name: Set the RDP password (never printed)
+        env:
+          LAB_PASSWORD: ${{ secrets.LAB_PASSWORD }}
+        run: |
+          set -uo pipefail
+          if [ -n "${LAB_PASSWORD:-}" ]; then PASS="$LAB_PASSWORD"; SRC="secret"; else PASS="$(openssl rand -hex 6)"; SRC="random"; fi
+          echo "::add-mask::$PASS"
+          # RDPPASS reaches the next steps (masked). The RDP user is 'abc' (uid 1000),
+          # the image's real Linux account.
+          echo "RDPPASS=${PASS}" >> "$GITHUB_ENV"
+          echo "CRED_SRC=${SRC}" >> "$GITHUB_ENV"
+          umask 077
+          printf 'user: abc\npass: %s\n' "$PASS" > /home/runner/.lab-credentials
+          echo "Password set (source: ${SRC}). It is not written to this log."
+
+      - name: Start the Kali desktop container
+        run: |
+          set -uo pipefail
+          docker run -d --name kali \
+            -e PUID=1000 -e PGID=1000 -e TZ=Etc/UTC \
+            -e CUSTOM_USER=kali -e PASSWORD="$RDPPASS" \
+            -e TITLE="Cloud Workstation" \
+            --shm-size=1gb --security-opt seccomp=unconfined \
+            -p 3389:3389 \
+            lscr.io/linuxserver/kali-linux:latest
+          echo "Container starting — first run pulls a multi-GB image, this can take several minutes."
+
+      - name: Wait for the desktop to come up
+        run: |
+          set -uo pipefail
+          for i in $(seq 1 150); do
+            # The image's own web desktop on 3000 answering means the container is ready
+            # even though we won't expose it — it's just the readiness signal.
+            code=$(docker exec kali sh -c "curl -s -o /dev/null -w '%{http_code}' http://localhost:3000/ 2>/dev/null" 2>/dev/null || true)
+            if [ "$code" = "200" ] || [ "$code" = "401" ]; then
+              echo "Desktop is up (HTTP $code)."
+              docker exec kali sh -c "grep PRETTY_NAME /etc/os-release" 2>/dev/null || true
+              exit 0
+            fi
+            sleep 10
+          done
+          echo "::error::Desktop did not come up in time. Recent container logs:"
+          docker logs --tail 150 kali || true
+          exit 1
+
+      - name: Set up xrdp inside the container
+        run: |
+          set -uo pipefail
+
+          echo "::group::Installing xrdp + XFCE in the container"
+          # The image serves a KDE Plasma *Wayland* desktop; xrdp is an X11 server and
+          # cannot attach to Wayland, so the RDP login gets its own XFCE X session.
+          # Recommends left ON so the icon themes come along.
+          docker exec kali bash -c '
+            set -e
+            export DEBIAN_FRONTEND=noninteractive
+            apt-get update -qq
+            apt-get install -y --no-install-recommends xrdp xorgxrdp dbus-x11 xvfb
+            apt-get install -y xfce4 xfce4-terminal adwaita-icon-theme
+          ' > /tmp/xrdp-install.log 2>&1 || { echo "::error::xrdp install failed"; tail -40 /tmp/xrdp-install.log; exit 1; }
+          echo "::endgroup::"
+
+          # The image's unix user 'abc' ships with no password; give it the RDP one.
+          docker exec kali bash -c "echo 'abc:${RDPPASS}' | chpasswd"
+
+          # Debian's X wrapper blocks non-console X servers; an RDP login isn't console.
+          printf 'allowed_users=anybody\nneeds_root_rights=yes\n' > /tmp/Xwrapper.config
+          docker cp /tmp/Xwrapper.config kali:/etc/X11/Xwrapper.config
+
+          # The session each RDP login starts — dropped in as a file to avoid nested
+          # heredoc quoting through docker exec.
+          cat > /tmp/startwm.sh <<'SH'
+          #!/bin/sh
+          unset DBUS_SESSION_BUS_ADDRESS
+          unset XDG_RUNTIME_DIR
+          unset WAYLAND_DISPLAY
+          export XDG_CURRENT_DESKTOP=XFCE
+          export XDG_SESSION_TYPE=x11
+          exec dbus-launch --exit-with-session startxfce4
+          SH
+          docker cp /tmp/startwm.sh kali:/etc/xrdp/startwm.sh
+          docker exec kali chmod +x /etc/xrdp/startwm.sh
+
+          # Cheap-to-redraw XFCE: no compositing, outline drag, flat background, and a
+          # seeded panel layout (an unseeded panel opens a modal first-start dialog that
+          # nobody can answer on a headless session, leaving a black desktop).
+          cat > /tmp/xfwm4.xml <<'XML'
+          <?xml version="1.0" encoding="UTF-8"?>
+          <channel name="xfwm4" version="1.0">
+            <property name="general" type="empty">
+              <property name="use_compositing" type="bool" value="false"/>
+              <property name="box_move" type="bool" value="true"/>
+              <property name="box_resize" type="bool" value="true"/>
+            </property>
+          </channel>
+          XML
+          cat > /tmp/xfce4-panel.xml <<'XML'
+          <?xml version="1.0" encoding="UTF-8"?>
+          <channel name="xfce4-panel" version="1.0">
+            <property name="panels" type="array">
+              <value type="int" value="1"/>
+              <property name="panel-1" type="empty">
+                <property name="position" type="string" value="p=6;x=0;y=0"/>
+                <property name="length" type="uint" value="100"/>
+                <property name="position-locked" type="bool" value="true"/>
+                <property name="size" type="uint" value="30"/>
+                <property name="plugin-ids" type="array">
+                  <value type="int" value="1"/>
+                  <value type="int" value="2"/>
+                  <value type="int" value="3"/>
+                  <value type="int" value="4"/>
+                  <value type="int" value="5"/>
+                </property>
+              </property>
+            </property>
+            <property name="plugins" type="empty">
+              <property name="plugin-1" type="string" value="applicationsmenu"/>
+              <property name="plugin-2" type="string" value="tasklist"/>
+              <property name="plugin-3" type="string" value="separator">
+                <property name="expand" type="bool" value="true"/>
+                <property name="style" type="uint" value="0"/>
+              </property>
+              <property name="plugin-4" type="string" value="systray"/>
+              <property name="plugin-5" type="string" value="clock"/>
+            </property>
+          </channel>
+          XML
+          cat > /tmp/xfce4-desktop.xml <<'XML'
+          <?xml version="1.0" encoding="UTF-8"?>
+          <channel name="xfce4-desktop" version="1.0">
+            <property name="backdrop" type="empty">
+              <property name="screen0" type="empty">
+                <property name="monitor0" type="empty">
+                  <property name="workspace0" type="empty">
+                    <property name="color-style" type="int" value="0"/>
+                    <property name="image-style" type="int" value="0"/>
+                    <property name="rgba1" type="array">
+                      <value type="double" value="0.1"/>
+                      <value type="double" value="0.1"/>
+                      <value type="double" value="0.12"/>
+                      <value type="double" value="1.0"/>
+                    </property>
+                  </property>
+                </property>
+              </property>
+            </property>
+          </channel>
+          XML
+
+          XFCONF=/config/.config/xfce4/xfconf/xfce-perchannel-xml
+          docker exec kali mkdir -p "$XFCONF"
+          docker cp /tmp/xfwm4.xml         "kali:${XFCONF}/xfwm4.xml"
+          docker cp /tmp/xfce4-panel.xml   "kali:${XFCONF}/xfce4-panel.xml"
+          docker cp /tmp/xfce4-desktop.xml "kali:${XFCONF}/xfce4-desktop.xml"
+          docker exec kali chown -R 1000:1000 /config/.config/xfce4 || true
+
+          docker exec kali sed -i 's/^address=127\.0\.0\.1/address=0.0.0.0/' /etc/xrdp/xrdp.ini || true
+
+          # No systemd in the container; start the daemons directly (the -d makes them
+          # outlive this step by belonging to the container's process tree).
+          docker exec kali mkdir -p /var/run/xrdp
+          docker exec -d kali /usr/sbin/xrdp-sesman
+          sleep 2
+          docker exec -d kali /usr/sbin/xrdp
+          sleep 3
+
+          # Require a real RDP handshake (0xD0 Connection Confirm), not just an open socket.
+          cat > /tmp/rdp_probe.py <<'PY'
+          import socket, sys
+          req = bytes.fromhex("030000130ee000000000000100080003000000")
+          try:
+              s = socket.create_connection(("127.0.0.1", 3389), timeout=5)
+              s.sendall(req); r = s.recv(19); s.close()
+          except Exception:
+              sys.exit(1)
+          sys.exit(0 if len(r) >= 6 and r[0] == 3 and r[5] == 0xD0 else 1)
+          PY
+          RDP_OK=0
+          for i in $(seq 1 30); do
+            if python3 /tmp/rdp_probe.py 2>/dev/null; then echo "xrdp answered a real RDP handshake."; RDP_OK=1; break; fi
+            sleep 2
+          done
+          if [ "$RDP_OK" != "1" ]; then
+            echo "::warning title=xrdp never answered::Diagnostics below; box stays up for SSH."
+            docker exec kali pgrep -a 'xrdp|xrdp-sesman' || echo "  no xrdp process!"
+            docker exec kali sh -c 'ss -ltnp 2>/dev/null | grep 3389 || netstat -ltnp 2>/dev/null | grep 3389' || echo "  nothing on 3389 in container"
+            docker exec kali tail -40 /var/log/xrdp.log 2>/dev/null || true
+            docker exec kali tail -40 /var/log/xrdp-sesman.log 2>/dev/null || true
+          fi
+
+      - name: Join the tailnet and hold it open
+        env:
+          TS_AUTHKEY: ${{ secrets.TS_AUTHKEY }}
+        run: |
+          set -uo pipefail
+          curl -fsSL https://tailscale.com/install.sh | sh >/dev/null 2>&1
+          sudo tailscale up --authkey="$TS_AUTHKEY" --hostname="$TS_HOSTNAME" --ssh --accept-routes \
+            > /tmp/ts.log 2>&1 || { echo "::error::tailscale up failed"; cat /tmp/ts.log || true; exit 1; }
+          TS_HOST=$(sudo tailscale status --json 2>/dev/null | jq -r '.Self.DNSName // empty' | sed 's/\.$//' || true)
+          TS_IP=$(sudo tailscale ip -4 2>/dev/null | head -1 || true)
+          [ -z "$TS_HOST" ] && { echo "::error::Tailscale joined but reported no hostname."; sudo tailscale status || true; exit 1; }
+          echo "Tailscale name: $TS_HOST  ip: $TS_IP"
+
+          SECS=$(awk -v h="$HOURS" 'BEGIN{s=h*3600; if(s<300)s=300; if(s>20520)s=20520; printf "%d", s}')
+          ENDS_AT=$(date -u -d "+${SECS} seconds" '+%H:%M UTC')
+
+          {
+            echo "# 🐉 Kali desktop is live — private, Tailscale RDP only"
+            echo ""
+            echo "## Connect (Remote Desktop)"
+            echo ""
+            echo "\`\`\`"
+            echo "${TS_HOST}:3389"
+            echo "\`\`\`"
+            echo "(or the IP \`${TS_IP}:3389\`)"
+            echo ""
+            echo "Open \`mstsc\` -> paste into **Computer** -> Connect. On Linux/macOS:"
+            echo "\`xfreerdp /v:${TS_HOST} /u:abc\`."
+            echo ""
+            echo "| | |"
+            echo "|---|---|"
+            echo "| Address | \`${TS_HOST}:3389\` (same every run) |"
+            echo "| Tailnet IP | \`${TS_IP}\` |"
+            echo "| Username | \`abc\` |"
+            echo "| Desktop | XFCE (Kali), compositing off |"
+            echo "| Shell too | \`ssh runner@${TS_HOST}\` — the host; \`docker exec -it kali bash\` for the Kali userland |"
+            echo "| Auto-stop | ~${ENDS_AT} |"
+            echo ""
+            if [ "${CRED_SRC}" = "secret" ]; then
+              echo "**Password:** your \`LAB_PASSWORD\` secret."
+            else
+              echo "**Password:** generated, **not shown here**. Read it over the tailnet:"
+              echo "\`\`\`"
+              echo "ssh runner@${TS_HOST} cat .lab-credentials"
+              echo "\`\`\`"
+            fi
+            echo ""
+            echo "> The RDP username is \`abc\` (the real Linux user), **not** \`kali\`."
+            echo "> You'll get a self-signed certificate warning on connect — accept it."
+            echo ""
+            echo "> **Private:** only your tailnet devices can reach it; nothing is exposed to"
+            echo "> the internet, and no password appears in this log."
+            echo ""
+            echo "---"
+            echo "_Ephemeral: nothing persists. \`ssh runner@${TS_HOST} touch STOP\` or cancel the run to stop early._"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+          echo "::notice title=Kali RDP::${TS_HOST}:3389  (user: abc)"
+
+          trap 'sudo tailscale logout >/dev/null 2>&1 || true' EXIT
+          END=$((SECONDS + SECS))
+          while [ $SECONDS -lt $END ]; do
+            if [ -f /home/runner/STOP ]; then echo "STOP file found — shutting down."; break; fi
+            if ! docker ps --format '{{.Names}}' | grep -q '^kali$'; then echo "::error::Kali container exited."; docker logs --tail 50 kali || true; exit 1; fi
+            if ! sudo tailscale status >/dev/null 2>&1; then
+              echo "::warning::Tailscale dropped; reconnecting."
+              sudo tailscale up --authkey="$TS_AUTHKEY" --hostname="$TS_HOSTNAME" --ssh --accept-routes >/tmp/ts.log 2>&1 || true
+            fi
+            sleep 15
+          done
+          echo "Shutting down. The box and everything on it is now gone."
