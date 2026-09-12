@@ -233,7 +233,10 @@ jobs:
           EndSection
           CONF
 
-          /usr/bin/Xorg :0 -config /etc/X11/xorg-dummy.conf -nolisten tcp vt1 > /tmp/xorg.log 2>&1 &
+          # Xorg via the setuid wrapper rejects an absolute -config path; it wants a
+          # bare filename and searches /etc/X11 (where we just wrote it). Passing the
+          # full path fails with "config must specify a relative path".
+          /usr/bin/Xorg :0 -config xorg-dummy.conf -noreset -nolisten tcp > /tmp/xorg.log 2>&1 &
           for i in $(seq 1 20); do xset -display :0 q >/dev/null 2>&1 && break; sleep 1; done
           if xset -display :0 q >/dev/null 2>&1; then echo "Virtual display :0 is up."; else
             echo "::warning title=X did not start::Stream may fail; box stays up for SSH debugging."; tail -40 /tmp/xorg.log || true
