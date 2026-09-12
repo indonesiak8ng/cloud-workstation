@@ -1,0 +1,287 @@
+name: Shell (Tailscale)
+
+# A full Ubuntu 24.04 box on a GitHub Actions runner, reachable ONLY over Tailscale.
+# Nothing is exposed to the public internet — no bore, no Cloudflare, no open ports.
+#
+#   the runner itself  ->  Ubuntu 24.04, 4 vCPU, 16 GB RAM, ~60 GB free after cleanup
+#   Tailscale SSH      ->  private WireGuard mesh, key-less auth, fixed name every run
+#
+# Unlike the Windows lab there is NO nested VM here. The runner is already Ubuntu, so
+# we use it directly: no QEMU tax, no install wait, the full 4 cores are yours and the
+# box is usable about 60 seconds after the run starts.
+#
+# Requires a TS_AUTHKEY repo secret and one ACL rule. Without either, the run fails
+# early and tells you exactly what to fix.
+on:
+  workflow_dispatch:
+    inputs:
+      hostname:
+        description: "Tailscale machine name. Becomes <name>.<tailnet>.ts.net."
+        type: string
+        default: "shell"
+      toolset:
+        description: "What to install on top of the base runner image."
+        type: choice
+        default: "security"
+        options: [ "base", "security", "dev", "everything" ]
+      hours:
+        description: "How long to hold the box open (max 5.7 — Actions hard-kills at 6h)."
+        type: string
+        default: "5.5"
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ubuntu-lab
+  cancel-in-progress: true
+
+jobs:
+  ubuntu-lab:
+    runs-on: ubuntu-latest
+    timeout-minutes: 360
+    env:
+      TS_HOSTNAME: ${{ inputs.hostname }}
+      TOOLSET: ${{ inputs.toolset }}
+      HOURS: ${{ inputs.hours }}
+    steps:
+      - name: Verify Tailscale secret exists
+        env:
+          TS_AUTHKEY: ${{ secrets.TS_AUTHKEY }}
+        run: |
+          if [ -z "${TS_AUTHKEY:-}" ]; then
+            echo "::error::TS_AUTHKEY secret is not set. This workflow requires Tailscale."
+            echo "::error::Repo → Settings → Secrets and variables → Actions → New repository secret → TS_AUTHKEY."
+            echo "::error::Get a key at https://login.tailscale.com/admin/settings/keys (Ephemeral + Reusable, NOT tagged)."
+            exit 1
+          fi
+          echo "TS_AUTHKEY is set."
+
+      - name: Reclaim disk space
+        run: |
+          set -uo pipefail
+          # The hosted image ships ~30 GB of toolchains most labs never touch. Dropping
+          # them roughly doubles the free space on / before anything else runs.
+          echo "Before:"; df -h / | tail -1
+          sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc \
+                      /opt/hostedtoolcache/CodeQL /usr/local/share/boost \
+                      /usr/local/share/powershell /usr/share/swift || true
+          sudo docker image prune -af > /dev/null 2>&1 || true
+          echo "After:"; df -h / | tail -1
+
+      - name: Join the tailnet with Tailscale SSH
+        env:
+          TS_AUTHKEY: ${{ secrets.TS_AUTHKEY }}
+        run: |
+          set -uo pipefail
+          curl -fsSL https://tailscale.com/install.sh | sh > /dev/null 2>&1
+
+          # --ssh is the whole point: tailscaled itself terminates SSH, so there are no
+          # keys to ship, no sshd to harden, and no port to expose. Authorisation comes
+          # from the tailnet ACL instead (see the error text below if it refuses you).
+          sudo tailscale up \
+            --authkey="$TS_AUTHKEY" \
+            --hostname="$TS_HOSTNAME" \
+            --ssh \
+            --accept-routes \
+            > /tmp/ts.log 2>&1 || { echo "::error::tailscale up failed"; cat /tmp/ts.log || true; exit 1; }
+
+          TS_HOST=$(sudo tailscale status --json 2>/dev/null | jq -r '.Self.DNSName // empty' | sed 's/\.$//' || true)
+          TS_IP=$(sudo tailscale ip -4 2>/dev/null | head -1 || true)
+          if [ -z "$TS_HOST" ]; then
+            echo "::error::Tailscale joined but would not report a hostname."
+            sudo tailscale status || true
+            exit 1
+          fi
+
+          {
+            echo "TS_HOST=$TS_HOST"
+            echo "TS_IP=$TS_IP"
+          } >> "$GITHUB_ENV"
+
+          echo "Tailscale name : $TS_HOST"
+          echo "Tailscale IPv4 : $TS_IP"
+
+          # A name ending in -1/-2 means an older node still holds the plain name.
+          # Ephemeral keys reap the old node within a few minutes, so this is usually
+          # self-healing — but say so rather than let the saved SSH alias break silently.
+          case "$TS_HOST" in
+            "$TS_HOSTNAME".*) : ;;
+            *) echo "::warning title=Name collision::Registered as ${TS_HOST}, not ${TS_HOSTNAME}.* — a previous node still holds that name. It should be reaped shortly; connect with the IP in the meantime." ;;
+          esac
+
+      - name: Install the toolset
+        run: |
+          set -uo pipefail
+          export DEBIAN_FRONTEND=noninteractive
+
+          # Created BEFORE the Kali container starts. Docker creates a missing bind-mount
+          # source itself, owned by root — and then 'runner' could not write to its own
+          # ~/lab, which would also break the STOP file in the next step.
+          mkdir -p /home/runner/lab
+
+          # Everything below is best-effort: a single unavailable package must not cost
+          # you the whole box, which is already reachable by this point. apt-get is
+          # all-or-nothing per invocation, so on failure retry one at a time and let the
+          # good packages through — then name the ones that genuinely did not exist.
+          apt_try () {
+            sudo apt-get install -y --no-install-recommends "$@" > /dev/null 2>&1 && return 0
+            failed=""
+            for p in "$@"; do
+              sudo apt-get install -y --no-install-recommends "$p" > /dev/null 2>&1 || failed="$failed $p"
+            done
+            [ -n "$failed" ] && echo "::warning title=Unavailable packages::$failed"
+            return 0
+          }
+
+          echo "::group::apt-get update"
+          sudo apt-get update -qq || true
+          echo "::endgroup::"
+
+          echo "::group::Shell comforts (always installed)"
+          apt_try tmux htop ncdu tree jq ripgrep fd-find fzf neovim zsh unzip p7zip-full
+          echo "::endgroup::"
+
+          if [ "$TOOLSET" = "security" ] || [ "$TOOLSET" = "everything" ]; then
+            echo "::group::Security tooling"
+            # Ubuntu's own universe packages only. Bolting Kali's apt repo onto Ubuntu
+            # is the classic way to end up with an unbootable package set — the Kali
+            # userland proper lives in the container below instead.
+            apt_try nmap masscan netcat-openbsd socat tcpdump tshark whois dnsutils \
+                    hydra john hashcat sqlmap nikto dirb wfuzz hping3 \
+                    binwalk foremost libimage-exiftool-perl steghide sshuttle proxychains4
+            echo "::endgroup::"
+
+            echo "::group::Kali toolbox container"
+            # The honest way to run Kali tools on an Ubuntu host: a rolling Kali
+            # userland in a container, sharing ~/lab and the host network namespace so
+            # scans, captures and reverse shells behave exactly as they would natively.
+            if sudo docker pull -q kalilinux/kali-rolling:latest; then
+              sudo docker run -d --name kali --network host --privileged \
+                -v /home/runner/lab:/root/lab -w /root/lab \
+                kalilinux/kali-rolling:latest sleep infinity > /dev/null
+
+              sudo docker exec kali bash -c '
+                export DEBIAN_FRONTEND=noninteractive
+                apt-get update -qq && apt-get install -y --no-install-recommends kali-linux-headless
+              ' > /tmp/kali-tools.log 2>&1 \
+                && echo "kali-linux-headless installed in the container." \
+                || { echo "::warning title=Kali metapackage failed::The container is up, tools are not. Tail:"; tail -20 /tmp/kali-tools.log || true; }
+
+              # `kali` drops you into that userland from any shell.
+              printf '#!/bin/sh\nexec sudo docker exec -it kali /bin/bash "$@"\n' > /tmp/kali
+              sudo install -m 0755 /tmp/kali /usr/local/bin/kali
+            else
+              echo "::warning title=Kali image unavailable::Host tools above still work."
+            fi
+            echo "::endgroup::"
+          fi
+
+          if [ "$TOOLSET" = "dev" ] || [ "$TOOLSET" = "everything" ]; then
+            echo "::group::Dev tooling"
+            apt_try build-essential python3-venv python3-pip pipx sqlite3 postgresql-client redis-tools
+            curl -LsSf https://astral.sh/uv/install.sh 2>/dev/null | sh > /dev/null 2>&1 \
+              || echo "::warning::uv install failed"
+            echo "::endgroup::"
+          fi
+
+          # Landing pad, so an SSH session opens with the map already in hand.
+          cat > /home/runner/.lab-motd <<MOTD
+
+            Ubuntu Lab — GitHub Actions runner, private on your tailnet
+            ----------------------------------------------------------
+            toolset   : ${TOOLSET}
+            workdir   : ~/lab   (shared with the Kali container)
+            kali      : run 'kali' for a Kali rolling shell (security/everything only)
+            stop early: touch ~/lab/STOP     — or cancel the run in the Actions tab
+            gone at   : auto-shutdown after ${HOURS}h, nothing persists
+
+          MOTD
+          grep -q lab-motd /home/runner/.bashrc 2>/dev/null \
+            || echo '[ -f "$HOME/.lab-motd" ] && cat "$HOME/.lab-motd"' >> /home/runner/.bashrc
+
+      - name: Publish the address and hold the box open
+        env:
+          TS_AUTHKEY: ${{ secrets.TS_AUTHKEY }}
+        run: |
+          set -uo pipefail
+
+          # Clamp to 5.7h. The 6h cap is a hard kill with no post-steps, so we stop
+          # short of it and exit cleanly — which is what lets tailscale logout run and
+          # frees the machine name for the next run.
+          SECS=$(awk -v h="$HOURS" 'BEGIN{s=h*3600; if(s<300)s=300; if(s>20520)s=20520; printf "%d", s}')
+          ENDS_AT=$(date -u -d "+${SECS} seconds" '+%H:%M UTC')
+
+          {
+            echo "# 🐧 Ubuntu lab is live — private, Tailscale only"
+            echo ""
+            echo "## Connect"
+            echo ""
+            echo "\`\`\`"
+            echo "ssh runner@${TS_HOST}"
+            echo "\`\`\`"
+            echo ""
+            echo "No password, no key, no port. Tailscale SSH authenticates you as your"
+            echo "tailnet identity — if your device is on the tailnet, you are already in."
+            echo ""
+            echo "| | |"
+            echo "|---|---|"
+            echo "| Machine | \`${TS_HOST}\` (same every run) |"
+            echo "| Tailnet IP | \`${TS_IP}\` |"
+            echo "| User | \`runner\` — passwordless \`sudo\` |"
+            echo "| Specs | Ubuntu 24.04, 4 vCPU, 16 GB RAM |"
+            echo "| Toolset | \`${TOOLSET}\` |"
+            echo "| Workdir | \`~/lab\` |"
+            echo "| Auto-stop | ~${ENDS_AT} |"
+            echo ""
+            if [ "$TOOLSET" = "security" ] || [ "$TOOLSET" = "everything" ]; then
+              echo "Run \`kali\` for a Kali rolling shell (\`kali-linux-headless\`), sharing"
+              echo "\`~/lab\` and the host network with Ubuntu."
+              echo ""
+            fi
+            echo "### If SSH says \"access denied\""
+            echo ""
+            echo "Tailscale SSH is gated by your tailnet ACL, not by this repo. Add this to"
+            echo "the policy file at [login.tailscale.com/admin/acls](https://login.tailscale.com/admin/acls):"
+            echo ""
+            echo '```json'
+            echo '"ssh": ['
+            echo '  {'
+            echo '    "action": "accept",'
+            echo '    "src":    ["autogroup:member"],'
+            echo '    "dst":    ["autogroup:self"],'
+            echo '    "users":  ["autogroup:nonroot", "root"]'
+            echo '  }'
+            echo ']'
+            echo '```'
+            echo ""
+            echo "\`autogroup:self\` only matches machines **you** own, so the auth key must be"
+            echo "untagged — a tagged key makes the tailnet the owner and this rule will not match."
+            echo ""
+            echo "---"
+            echo "_Ephemeral: nothing persists between runs. \`touch ~/lab/STOP\` to shut down"
+            echo "early from inside the box, or cancel the run from the Actions tab._"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+          echo "::notice title=SSH::ssh runner@${TS_HOST}   (or ${TS_IP})"
+          echo "======================================================"
+          echo "  ssh runner@${TS_HOST}"
+          echo "  ip: ${TS_IP}   stops: ${ENDS_AT}"
+          echo "======================================================"
+
+          trap 'sudo tailscale logout >/dev/null 2>&1 || true' EXIT
+
+          END=$((SECONDS + SECS))
+          while [ $SECONDS -lt $END ]; do
+            if [ -f /home/runner/lab/STOP ]; then
+              echo "STOP file found — shutting down at your request."
+              break
+            fi
+            if ! sudo tailscale status > /dev/null 2>&1; then
+              echo "::warning::Tailscale dropped. Reconnecting..."
+              sudo tailscale up --authkey="$TS_AUTHKEY" --hostname="$TS_HOSTNAME" \
+                --ssh --accept-routes > /tmp/ts.log 2>&1 || true
+            fi
+            sleep 15
+          done
+          echo "Shutting down. The box and everything on it is now gone."

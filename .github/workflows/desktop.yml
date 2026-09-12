@@ -1,0 +1,327 @@
+name: Desktop (Tailscale)
+
+# A full XFCE desktop on an Ubuntu 24.04 runner, reachable ONLY over Tailscale by RDP.
+# Nothing is exposed to the public internet, and no password ever reaches the run log.
+#
+#   the runner itself  ->  Ubuntu 24.04, 4 vCPU, 16 GB RAM (no nested VM, no container)
+#   xrdp + XFCE        ->  native RDP, tuned to be cheap to redraw over a link
+#   Tailscale          ->  private WireGuard mesh; fixed name every run
+#
+# The desktop is installed on the runner directly rather than in a container: no Docker
+# userland proxy between your RDP client and the X server, no image to pull, and the full
+# 4 cores go to the desktop. That is as smooth as a CPU-only cloud GUI gets.
+#
+# Requires a TS_AUTHKEY secret. Optionally a LAB_PASSWORD secret (see "Credentials" below).
+on:
+  workflow_dispatch:
+    inputs:
+      hostname:
+        description: "Tailscale machine name -> <name>.<tailnet>.ts.net"
+        type: string
+        default: "desktop"
+      hours:
+        description: "How long to hold it open (max 5.7; shorter = lower profile)."
+        type: string
+        default: "3"
+
+permissions:
+  contents: read
+
+concurrency:
+  group: desktop
+  cancel-in-progress: true
+
+jobs:
+  desktop:
+    runs-on: ubuntu-latest
+    timeout-minutes: 360
+    env:
+      TS_HOSTNAME: ${{ inputs.hostname }}
+      HOURS: ${{ inputs.hours }}
+    steps:
+      - name: Verify Tailscale secret exists
+        env:
+          TS_AUTHKEY: ${{ secrets.TS_AUTHKEY }}
+        run: |
+          if [ -z "${TS_AUTHKEY:-}" ]; then
+            echo "::error::TS_AUTHKEY secret is not set. This workflow requires Tailscale."
+            echo "::error::Repo -> Settings -> Secrets and variables -> Actions -> New repository secret -> TS_AUTHKEY."
+            echo "::error::Get a key at https://login.tailscale.com/admin/settings/keys (Ephemeral + Reusable, NOT tagged)."
+            exit 1
+          fi
+          echo "TS_AUTHKEY is set."
+
+      - name: Set the RDP password (never printed)
+        env:
+          LAB_PASSWORD: ${{ secrets.LAB_PASSWORD }}
+        run: |
+          set -uo pipefail
+          # Two sources, both keeping the password out of the public run log:
+          #   - LAB_PASSWORD secret set  -> use it. You already know it; nothing to fetch.
+          #   - not set                  -> generate one, readable ONLY over Tailscale SSH.
+          if [ -n "${LAB_PASSWORD:-}" ]; then
+            PASS="$LAB_PASSWORD"; SRC="secret"
+          else
+            PASS="$(openssl rand -hex 6)"; SRC="random"
+          fi
+          # Mask it so it cannot surface even if some later command echoes it by accident.
+          echo "::add-mask::$PASS"
+          echo "runner:${PASS}" | sudo chpasswd
+
+          # Drop a copy only on the box itself, private to the runner user (mode 600).
+          # With a random password this is how you retrieve it: over Tailscale SSH, below.
+          umask 077
+          printf 'user: runner\npass: %s\n' "$PASS" > /home/runner/.lab-credentials
+          echo "CRED_SRC=${SRC}" >> "$GITHUB_ENV"
+          echo "Password set (source: ${SRC}). It is not written to this log."
+
+      - name: Install XFCE + xrdp
+        run: |
+          set -uo pipefail
+          export DEBIAN_FRONTEND=noninteractive
+          echo "::group::apt"
+          sudo apt-get update -qq
+          # Recommends are left ON for the desktop packages on purpose: with
+          # --no-install-recommends XFCE comes up as captionless text where the icon
+          # themes should be. The RDP server bits stay lean.
+          sudo apt-get install -y --no-install-recommends xrdp xorgxrdp xorg dbus-x11
+          sudo apt-get install -y xfce4 xfce4-terminal adwaita-icon-theme
+          echo "::endgroup::"
+
+      - name: Tune xrdp + XFCE for a smooth link
+        run: |
+          set -uo pipefail
+
+          # --- Debian's X wrapper blocks non-console X servers -------------------
+          # Default allowed_users=console; an RDP login is not a console login, so
+          # Xorg would exit before xorgxrdp loaded.
+          printf 'allowed_users=anybody\nneeds_root_rights=yes\n' | sudo tee /etc/X11/Xwrapper.config > /dev/null
+
+          # xrdp reads its TLS key from the ssl-cert group; let it.
+          sudo adduser xrdp ssl-cert > /dev/null 2>&1 || true
+
+          # --- The session each RDP login starts --------------------------------
+          cat > /tmp/startwm.sh <<'SH'
+          #!/bin/sh
+          unset DBUS_SESSION_BUS_ADDRESS XDG_RUNTIME_DIR WAYLAND_DISPLAY
+          export XDG_CURRENT_DESKTOP=XFCE
+          export XDG_SESSION_TYPE=x11
+          exec dbus-launch --exit-with-session startxfce4
+          SH
+          sudo cp /tmp/startwm.sh /etc/xrdp/startwm.sh
+          sudo chmod +x /etc/xrdp/startwm.sh
+
+          # --- Make the desktop cheap to redraw ---------------------------------
+          # Compositing draws every window twice and re-encodes the result; over a
+          # link that is pure cost. box_move/box_resize are outline-drag: one cheap
+          # redraw instead of a full repaint per pixel moved.
+          XFCONF="/home/runner/.config/xfce4/xfconf/xfce-perchannel-xml"
+          mkdir -p "$XFCONF"
+
+          cat > "$XFCONF/xfwm4.xml" <<'XML'
+          <?xml version="1.0" encoding="UTF-8"?>
+          <channel name="xfwm4" version="1.0">
+            <property name="general" type="empty">
+              <property name="use_compositing" type="bool" value="false"/>
+              <property name="box_move" type="bool" value="true"/>
+              <property name="box_resize" type="bool" value="true"/>
+            </property>
+          </channel>
+          XML
+
+          # Seed a panel layout, or the first-start dialog leaves you with no taskbar
+          # on a headless session that nobody can click through.
+          cat > "$XFCONF/xfce4-panel.xml" <<'XML'
+          <?xml version="1.0" encoding="UTF-8"?>
+          <channel name="xfce4-panel" version="1.0">
+            <property name="panels" type="array">
+              <value type="int" value="1"/>
+              <property name="panel-1" type="empty">
+                <property name="position" type="string" value="p=6;x=0;y=0"/>
+                <property name="length" type="uint" value="100"/>
+                <property name="position-locked" type="bool" value="true"/>
+                <property name="size" type="uint" value="30"/>
+                <property name="plugin-ids" type="array">
+                  <value type="int" value="1"/>
+                  <value type="int" value="2"/>
+                  <value type="int" value="3"/>
+                  <value type="int" value="4"/>
+                  <value type="int" value="5"/>
+                </property>
+              </property>
+            </property>
+            <property name="plugins" type="empty">
+              <property name="plugin-1" type="string" value="applicationsmenu"/>
+              <property name="plugin-2" type="string" value="tasklist"/>
+              <property name="plugin-3" type="string" value="separator">
+                <property name="expand" type="bool" value="true"/>
+                <property name="style" type="uint" value="0"/>
+              </property>
+              <property name="plugin-4" type="string" value="systray"/>
+              <property name="plugin-5" type="string" value="clock"/>
+            </property>
+          </channel>
+          XML
+
+          # A flat background is one region to encode; the default gradient is a full
+          # screen of detail behind every window you move.
+          cat > "$XFCONF/xfce4-desktop.xml" <<'XML'
+          <?xml version="1.0" encoding="UTF-8"?>
+          <channel name="xfce4-desktop" version="1.0">
+            <property name="backdrop" type="empty">
+              <property name="screen0" type="empty">
+                <property name="monitor0" type="empty">
+                  <property name="workspace0" type="empty">
+                    <property name="color-style" type="int" value="0"/>
+                    <property name="image-style" type="int" value="0"/>
+                    <property name="rgba1" type="array">
+                      <value type="double" value="0.1"/>
+                      <value type="double" value="0.1"/>
+                      <value type="double" value="0.12"/>
+                      <value type="double" value="1.0"/>
+                    </property>
+                  </property>
+                </property>
+              </property>
+            </property>
+          </channel>
+          XML
+
+          # Don't let a screensaver lock the session and shut you out mid-run.
+          cat > "$XFCONF/xfce4-screensaver.xml" <<'XML'
+          <?xml version="1.0" encoding="UTF-8"?>
+          <channel name="xfce4-screensaver" version="1.0">
+            <property name="saver" type="empty">
+              <property name="enabled" type="bool" value="false"/>
+            </property>
+            <property name="lock" type="empty">
+              <property name="enabled" type="bool" value="false"/>
+            </property>
+          </channel>
+          XML
+
+          # Bind all interfaces so the tailnet address can reach it (xrdp defaults to
+          # this; cheap insurance if a packaged default ever changes to loopback).
+          sudo sed -i 's/^address=127\.0\.0\.1/address=0.0.0.0/' /etc/xrdp/xrdp.ini || true
+
+          sudo systemctl enable xrdp > /dev/null 2>&1 || true
+          sudo systemctl restart xrdp-sesman xrdp 2>/dev/null || sudo systemctl restart xrdp
+
+          # --- Verify it genuinely speaks RDP -----------------------------------
+          # A TCP connect only proves the socket opened. Send a real X.224 Connection
+          # Request and require a Connection Confirm (0xD0) back.
+          cat > /tmp/rdp_probe.py <<'PY'
+          import socket, sys
+          req = bytes.fromhex("030000130ee000000000000100080003000000")
+          try:
+              s = socket.create_connection(("127.0.0.1", 3389), timeout=5)
+              s.sendall(req); r = s.recv(19); s.close()
+          except Exception:
+              sys.exit(1)
+          sys.exit(0 if len(r) >= 6 and r[0] == 3 and r[5] == 0xD0 else 1)
+          PY
+          for i in $(seq 1 30); do
+            if python3 /tmp/rdp_probe.py 2>/dev/null; then
+              echo "xrdp answered a real RDP handshake."; exit 0
+            fi
+            sleep 2
+          done
+          echo "::warning title=xrdp never answered::Diagnostics follow; the run continues so you can inspect."
+          sudo systemctl status xrdp --no-pager -l | tail -30 || true
+          sudo ss -ltnp | grep 3389 || echo "  nothing listening on 3389"
+          sudo tail -40 /var/log/xrdp.log 2>/dev/null || true
+          sudo tail -40 /var/log/xrdp-sesman.log 2>/dev/null || true
+
+      - name: Join the tailnet and hold the desktop open
+        env:
+          TS_AUTHKEY: ${{ secrets.TS_AUTHKEY }}
+        run: |
+          set -uo pipefail
+          curl -fsSL https://tailscale.com/install.sh | sh > /dev/null 2>&1
+
+          # --ssh gives a keyless terminal in as well — and, with a random password,
+          # it is how you read that password without it ever touching this log.
+          sudo tailscale up \
+            --authkey="$TS_AUTHKEY" \
+            --hostname="$TS_HOSTNAME" \
+            --ssh \
+            --accept-routes \
+            > /tmp/ts.log 2>&1 || { echo "::error::tailscale up failed"; cat /tmp/ts.log || true; exit 1; }
+
+          TS_HOST=$(sudo tailscale status --json 2>/dev/null | jq -r '.Self.DNSName // empty' | sed 's/\.$//' || true)
+          TS_IP=$(sudo tailscale ip -4 2>/dev/null | head -1 || true)
+          if [ -z "$TS_HOST" ]; then
+            echo "::error::Tailscale joined but would not report a hostname."; sudo tailscale status || true; exit 1
+          fi
+          echo "Tailscale name : $TS_HOST"
+
+          case "$TS_HOST" in
+            "$TS_HOSTNAME".*) : ;;
+            *) echo "::warning title=Name collision::Registered as ${TS_HOST}, not ${TS_HOSTNAME}.* — a previous node still holds that name. Ephemeral keys reap it shortly; use the IP meanwhile." ;;
+          esac
+
+          # Clamp to 5.7h so we exit cleanly before the 6h hard kill — which is what
+          # lets tailscale logout run and frees the machine name for next time.
+          SECS=$(awk -v h="$HOURS" 'BEGIN{s=h*3600; if(s<300)s=300; if(s>20520)s=20520; printf "%d", s}')
+          ENDS_AT=$(date -u -d "+${SECS} seconds" '+%H:%M UTC')
+
+          {
+            echo "# Desktop is live — private, Tailscale only"
+            echo ""
+            echo "## Connect (Remote Desktop)"
+            echo ""
+            echo "\`\`\`"
+            echo "${TS_HOST}:3389"
+            echo "\`\`\`"
+            echo ""
+            echo "Open \`mstsc\` (Win key -> type mstsc) -> paste the address into **Computer** -> Connect."
+            echo "On Linux/macOS: \`xfreerdp /v:${TS_HOST} /u:runner\` or Remmina / Windows App."
+            echo ""
+            echo "| | |"
+            echo "|---|---|"
+            echo "| Address | \`${TS_HOST}:3389\` (same every run) |"
+            echo "| Tailnet IP | \`${TS_IP}\` |"
+            echo "| Username | \`runner\` |"
+            echo "| Desktop | XFCE, compositing off (tuned for the link) |"
+            echo "| Specs | Ubuntu 24.04, 4 vCPU, 16 GB RAM |"
+            echo "| Auto-stop | ~${ENDS_AT} |"
+            echo ""
+            if [ "${CRED_SRC}" = "secret" ]; then
+              echo "**Password:** the one you set in the \`LAB_PASSWORD\` secret."
+            else
+              echo "**Password:** randomly generated and **never shown here**. Read it over the"
+              echo "tailnet (keyless — Tailscale SSH):"
+              echo ""
+              echo "\`\`\`"
+              echo "ssh runner@${TS_HOST} cat .lab-credentials"
+              echo "\`\`\`"
+              echo ""
+              echo "> Set a \`LAB_PASSWORD\` repo secret to skip this step on future runs."
+            fi
+            echo ""
+            echo "> You'll get a self-signed certificate warning on connect — expected, accept it."
+            echo ""
+            echo "### Nothing here is public"
+            echo "Only devices on **your** tailnet can reach \`${TS_HOST}\`; no port is exposed to"
+            echo "the internet, and no password appears in this log."
+            echo ""
+            echo "If RDP says access denied on \`ssh\`, add an SSH rule to your tailnet ACL —"
+            echo "see \`setup.md\`."
+            echo ""
+            echo "---"
+            echo "_Ephemeral: nothing persists. \`touch ~/STOP\` on the box, or cancel the run, to stop early._"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+          echo "::notice title=Remote Desktop::${TS_HOST}:3389  (user: runner)"
+
+          trap 'sudo tailscale logout >/dev/null 2>&1 || true' EXIT
+          END=$((SECONDS + SECS))
+          while [ $SECONDS -lt $END ]; do
+            if [ -f /home/runner/STOP ]; then echo "STOP file found — shutting down."; break; fi
+            if ! sudo tailscale status > /dev/null 2>&1; then
+              echo "::warning::Tailscale dropped. Reconnecting..."
+              sudo tailscale up --authkey="$TS_AUTHKEY" --hostname="$TS_HOSTNAME" --ssh --accept-routes > /tmp/ts.log 2>&1 || true
+            fi
+            sleep 15
+          done
+          echo "Shutting down. The box and everything on it is now gone."
