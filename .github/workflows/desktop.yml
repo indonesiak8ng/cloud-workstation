@@ -253,15 +253,28 @@ jobs:
           dbus-launch --exit-with-session startxfce4 > /tmp/xfce.log 2>&1 &
           sleep 6
 
+          # --- Join the tailnet FIRST, so we know our address for CSRF ----------
+          curl -fsSL https://tailscale.com/install.sh | sh >/dev/null 2>&1
+          sudo tailscale up --authkey="$TS_AUTHKEY" --hostname="$TS_HOSTNAME" --ssh --accept-routes \
+            > /tmp/ts.log 2>&1 || { echo "::error::tailscale up failed"; cat /tmp/ts.log || true; exit 1; }
+          TS_HOST=$(sudo tailscale status --json 2>/dev/null | jq -r '.Self.DNSName // empty' | sed 's/\.$//' || true)
+          TS_IP=$(sudo tailscale ip -4 2>/dev/null | head -1 || true)
+          [ -z "$TS_HOST" ] && { echo "::error::Tailscale joined but reported no hostname."; sudo tailscale status || true; exit 1; }
+          echo "Tailscale name: $TS_HOST  ip: $TS_IP"
+
           # --- Sunshine: web UI creds + software H.264 config -------------------
+          # csrf_allowed_origins lets the web UI accept the PIN request when opened on
+          # the tailnet address (the IP or the MagicDNS name), not just localhost —
+          # otherwise Sunshine blocks it with a CSRF error.
           mkdir -p /home/runner/.config/sunshine
-          cat > /home/runner/.config/sunshine/sunshine.conf <<'CONF'
-          encoder = software
-          sw_preset = ultrafast
-          sw_tune = zerolatency
-          origin_web_ui_allowed = wan
-          min_log_level = info
-          CONF
+          {
+            echo "encoder = software"
+            echo "sw_preset = ultrafast"
+            echo "sw_tune = zerolatency"
+            echo "origin_web_ui_allowed = wan"
+            echo "csrf_allowed_origins = https://${TS_IP}:47990,https://${TS_HOST}:47990"
+            echo "min_log_level = info"
+          } > /home/runner/.config/sunshine/sunshine.conf
           sunshine --creds runner "$PASS" >/tmp/creds.log 2>&1 || echo "::warning::could not seed web UI credentials; see /tmp/creds.log"
           sunshine /home/runner/.config/sunshine/sunshine.conf > /tmp/sunshine.log 2>&1 &
 
@@ -269,15 +282,11 @@ jobs:
             curl -sk https://127.0.0.1:47990/ >/dev/null 2>&1 && { echo "Sunshine is up."; break; }
             sleep 2
           done
-
-          # --- Join the tailnet (--ssh gives you a shell on the same box too) ---
-          curl -fsSL https://tailscale.com/install.sh | sh >/dev/null 2>&1
-          sudo tailscale up --authkey="$TS_AUTHKEY" --hostname="$TS_HOSTNAME" --ssh --accept-routes \
-            > /tmp/ts.log 2>&1 || { echo "::error::tailscale up failed"; cat /tmp/ts.log || true; exit 1; }
-          TS_HOST=$(sudo tailscale status --json 2>/dev/null | jq -r '.Self.DNSName // empty' | sed 's/\.$//' || true)
-          TS_IP=$(sudo tailscale ip -4 2>/dev/null | head -1 || true)
-          [ -z "$TS_HOST" ] && { echo "::error::Tailscale joined but reported no hostname."; sudo tailscale status || true; exit 1; }
-          echo "Tailscale name: $TS_HOST"
+          # If Sunshine did not stay up, surface why right here in the run log.
+          if ! pgrep -x sunshine >/dev/null 2>&1; then
+            echo "::warning title=Sunshine did not stay up::last 30 log lines below"
+            tail -30 /tmp/sunshine.log || true
+          fi
 
           SECS=$(awk -v h="$HOURS" 'BEGIN{s=h*3600; if(s<300)s=300; if(s>20520)s=20520; printf "%d", s}')
           ENDS_AT=$(date -u -d "+${SECS} seconds" '+%H:%M UTC')
@@ -335,9 +344,12 @@ jobs:
           END=$((SECONDS + SECS))
           while [ $SECONDS -lt $END ]; do
             if [ -f /home/runner/STOP ]; then echo "STOP file found — shutting down."; break; fi
-            # Keep the stream alive: if Sunshine dies, bring it back.
+            # Keep the stream alive: if Sunshine dies, show why, then bring it back —
+            # but back off so a hard-crashing Sunshine doesn't spam the log.
             if ! pgrep -x sunshine >/dev/null 2>&1; then
-              echo "::warning::Sunshine exited; restarting."; sunshine /home/runner/.config/sunshine/sunshine.conf > /tmp/sunshine.log 2>&1 &
+              echo "::warning::Sunshine exited; last log lines:"; tail -15 /tmp/sunshine.log || true
+              sunshine /home/runner/.config/sunshine/sunshine.conf > /tmp/sunshine.log 2>&1 &
+              sleep 30
             fi
             if ! sudo tailscale status >/dev/null 2>&1; then
               echo "::warning::Tailscale dropped; reconnecting."
